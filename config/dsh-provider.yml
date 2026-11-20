@@ -1,19 +1,29 @@
 # ---------------------------------------------------------------------------
-# DSH provider snippet — paste this into your profile's
-#   llm-pi-ai config.providers
-# (normally ~/.dsh/profiles/<profile>/cordis.patch.yml, under the
-#  `@deepseek-ai/dsh-llm-pi-ai` service block's `config.providers`).
+# DSH provider snippet — for ADVANCED users only.
 #
-# This registers the `deveco` provider that talks to the local proxy this
-# plugin manages. It is a plain provider entry — no personal data, no account
-# credentials, no API key. The proxy ignores the bearer token; the placeholder
-# key only needs to be a non-empty string so DSH accepts the provider.
+# MOST USERS CAN IGNORE THIS FILE. Since v1.1 the bundle's cordis.patch.yml
+# auto-registers the `deveco` provider, so on a fresh/default DSH profile the
+# GLM models appear automatically after installing the bundle — no manual
+# edit and no environment variable needed.
+#
+# WHO still needs this: if YOUR profile already has an `llm-pi-ai` row with
+# `config.providers` (e.g. you configured fox-aws or other providers), DSH
+# replaces that config wholesale and YOUR row wins over the bundle's. In that
+# case add the `deveco:` block below into YOUR OWN `config.providers` once,
+# next to your existing providers (mind the indentation). Do NOT paste it
+# anywhere else and do NOT overwrite your whole profile.
+#
+# This entry uses an inline `headers.authorization` instead of apiKeyEnv, so
+# it needs NO environment variable: pi-ai treats a non-empty Authorization
+# header as the API key, and the local proxy ignores the bearer value.
+# Contains no personal data and no account credentials.
 # ---------------------------------------------------------------------------
 deveco:
   displayName: DevEco Code
-  apiKeyEnv: DEVECO_DUMMY_KEY
   api: openai-completions
   baseURL: http://127.0.0.1:17128/v2
+  headers:
+    authorization: Bearer deveco-local
   models:
     - id: GLM-5.3-DevEco
       name: GLM-5.3 (DevEco)

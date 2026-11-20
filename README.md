@@ -44,7 +44,8 @@
 - **看门狗**：每 60 秒检测一次，代理意外退出会自动拉起（记录自动重启次数）。
 - **跨权限停止**：代理若以管理员权限运行，普通权限的停止仍可通过 WMI 完成。
 - **AI 工具**：向 DSH 内的智能体暴露 `deveco_proxy` 工具，动作 `status / start / stop / restart / login / logout`。
-- **开箱即用**：随包内置 `opencode-deveco` 代理与其 `undici` 运行时，提供一键安装脚本与 DSH provider 配置样例。
+- **模型自动出现**：安装 bundle 后 `deveco` provider 自动注册，模型选择器里直接出现 GLM-5.3 / GLM-5.1，无需手动改配置、无需设环境变量（见下方「工作原理」的适用范围）。
+- **开箱即用**：随包内置 `opencode-deveco` 代理与其 `undici` 运行时，提供 Windows 一键初始化脚本。
 
 ## 工作原理
 
@@ -58,7 +59,12 @@ DeepSeek Harness
 华为 DevEco Code 模型服务 (cn.devecostudio.huawei.com/.../v2)
 ```
 
-本插件本身**不注册模型 provider**，只负责管理上面的「本地代理」。真正的 provider 由你按 [`config/dsh-provider.yml`](config/dsh-provider.yml) 合并到 DSH 配置中。配置文件里只需要一个非空占位 key（`DEVECO_DUMMY_KEY`），本地代理并不校验它。
+本插件在安装时通过 bundle 的 `cordis.patch.yml` **自动注册 `deveco` provider**：DSH 默认 profile 本就挂载了 `llm-pi-ai`（无配置、休眠态），我们的 patch 直接给它补上 `deveco` provider，使用内联 `headers.authorization`（pi-ai 接受非空的 Authorization 头作为 key，本地代理忽略 bearer 值），因此**既不用手动改配置，也不用设环境变量**，装完即出模型。
+
+适用范围（DSH 的 config 是整块替换、不是深合并）：
+
+- **全新 / 默认用户**（自己的 profile 里没有 `llm-pi-ai` 配置行）：自动注册生效，模型直接出现。✅
+- **高级用户**（自己的 profile 里已有 `llm-pi-ai` 且配了其它 provider，如 fox-aws）：他那层配置会整体覆盖 bundle，本插件的自动注册被忽略，为了不破坏他的其它 provider，需要手动把 [`config/dsh-provider.yml`](config/dsh-provider.yml) 的 `deveco` 块加进他自己的 `config.providers` 一次。这是无冲突前提下的最小妥协。
 
 模型：`GLM-5.3-DevEco` / `GLM-5.1-DevEco`。渠道标称 17 万上下文 / 3.2 万输出；实际额度与频率限制以你的华为账号为准。所谓「每天 500M 额度」的说法未在华为官方渠道核实到——DevEco Code 的 GLM 通常被描述为免费不限量，「500 万 token」更像是智谱 ZCode 的活动口径，请勿以此为准。
 
@@ -72,7 +78,7 @@ dsh-connect-deveco/
 ├── icon.svg                       # 插件图标（原创）
 ├── stop-proxy-wmi.ps1             # 跨权限停止代理的兜底脚本
 ├── locale/{zh,en}.json            # 界面文案
-├── config/dsh-provider.yml        # 需合并到 DSH 的 provider 配置样例
+├── config/dsh-provider.yml        # 高级用户手动合并用的 provider 样例（多数人无需）
 ├── scripts/setup-windows.ps1      # Windows 一键初始化（幂等）
 ├── vendor/opencode-deveco/        # 内置代理（MIT）+ 其 undici 运行时
 ├── dev/                           # 自检脚本（verify-client / verify-render）
@@ -118,33 +124,30 @@ OAuth 是华为开放平台的标准授权机制（<https://developer.huawei.com
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup-windows.ps1
 ```
 
-脚本做三件事（可重复运行）：
+脚本做两件事（可重复运行）：
 
 1. 若内置运行时尚未安装，执行 `npm install --omit=dev` 安装 `undici`；
-2. 若未设置，写入用户级环境变量 `DEVECO_DUMMY_KEY=dsh-local-proxy-placeholder`；
-3. 在「启动」文件夹安装开机自启脚本 `DevEcoProxy.vbs`（静默、无需管理员权限）。
+2. 在「启动」文件夹安装开机自启脚本 `DevEcoProxy.vbs`（静默、无需管理员权限）。
 
-脚本**不会**替你改 DSH provider 配置，也**不会**触碰华为凭据。
+脚本**不会**改 DSH provider 配置（bundle 会自动注册），也**不会**触碰华为凭据。
 
-### 第 3 步：把 provider 配置合并进 DSH
+### 第 3 步：安装并启用插件 bundle
 
-打开 [`config/dsh-provider.yml`](config/dsh-provider.yml)，把其中的 `deveco:` 块粘贴到你 DSH profile 的 `llm-pi-ai` 服务 `config.providers` 下（通常是 `~/.dsh/profiles/<profile>/cordis.patch.yml`）。注意缩进与已有的 provider（如 `fox-aws`）对齐。**不要**直接覆盖整个 profile——里面还有你自己的默认模型和其他 provider。
+在 DSH 中安装本目录为 bundle（插件管理器 → 从本地目录安装，选择本仓库根目录），确保 `dsh-connect-deveco` 处于启用状态。provider 与模型由 bundle 的 `cordis.patch.yml` **自动注册**，无需手动合并配置。
 
-### 第 4 步：安装并启用插件 bundle
+> **仅高级用户**：如果你自己的 profile 里已经配置了 `llm-pi-ai` 的 `config.providers`（例如放过 fox-aws），那层配置会整体覆盖 bundle，自动注册会被忽略。为不破坏你已有的 provider，请把 [`config/dsh-provider.yml`](config/dsh-provider.yml) 的 `deveco:` 块手动加进**你自己**的 `config.providers`（注意缩进对齐），一次即可。**不要**覆盖整个 profile。
 
-在 DSH 中安装本目录为 bundle（插件管理器 → 从本地目录安装，选择本仓库根目录），确保 `dsh-connect-deveco` 处于启用状态。
+### 第 4 步：重启 DSH 并刷新界面
 
-### 第 5 步：重启 DSH 并刷新界面
+重启 DSH 让 bundle 注册的 provider 生效；用 dsh web 打印出的地址重新打开 Web GUI，按 **F5** 刷新（客户端代码只在页面加载时注册）。此时模型选择器里应已出现 DevEco Code 的两个 GLM 模型。
 
-重启 DSH 让新的环境变量与 provider 生效；用 dsh web 打印出的地址重新打开 Web GUI，按 **F5** 刷新（客户端代码只在页面加载时注册）。
-
-### 第 6 步：登录华为账号
+### 第 5 步：登录华为账号
 
 在 DSH **设置 → DevEco Code** 面板点击「登录」（未登录时）或「重新登录」（已登录时）。插件会打开系统默认浏览器（优先 Edge / Chrome）访问华为 OAuth 页；确认是你的账号后点「允许」完成授权。回到 DSH，等状态胶囊变绿（最多 10 秒轮询）。
 
 授权票据到期后，胶囊会显示「授权已过期」并变色，点击胶囊即可跳回设置页重新登录；也可以在设置页点「登出」清除本地凭据后重新走登录流程。
 
-### 第 7 步：在 DSH 里选用模型
+### 第 6 步：在 DSH 里选用模型
 
 在会话的模型选择里切换到 **DevEco Code → GLM-5.3-DevEco**（或 GLM-5.1-DevEco）即可对话。若提示 `503 / connect-refused`，多半是代理没起来——按下方排障处理。
 
@@ -183,6 +186,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup-windows.ps1
 | 代理根目录 | 随包 `vendor/opencode-deveco` | 环境变量 `DEVECO_PROXY_ROOT` 或插件配置 `config.proxyRoot` 可覆盖为你自己的 checkout |
 | 代理端口 | `17128` | 与 DSH provider 的 `baseURL` 保持一致 |
 | 看门狗周期 | 60 秒 | 检测代理是否存活，异常退出自动拉起 |
+| provider 注册 | bundle 自动 | `cordis.patch.yml` 给 `llm-pi-ai` 补 `deveco`；仅已有自定义 `llm-pi-ai` 配置的高级用户需按 `config/dsh-provider.yml` 手动加一次 |
 
 ## 常见问题与排障
 

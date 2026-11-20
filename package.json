@@ -1,6 +1,6 @@
 {
   "name": "dsh-connect-deveco",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "DSH bundle plugin: manage the local opencode-deveco proxy that brings DevEco Code (Huawei GLM) into DeepSeek Harness — status chip, start/stop/restart, Huawei OAuth login/logout, and a watchdog.",
   "license": "MIT",

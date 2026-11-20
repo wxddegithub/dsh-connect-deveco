@@ -1,3 +1,39 @@
 - insert:
     - id: dsh-connect-deveco
       name: dsh-connect-deveco
+
+# ---------------------------------------------------------------------------
+# Auto-register the deveco provider so the GLM models appear in DSH's model
+# picker immediately after installing this bundle — no manual profile edit
+# and no environment variable required.
+#
+# llm-pi-ai is mounted by dsh-base on every profile with NO config (dormant).
+# This override supplies the `deveco` provider using an inline
+# `headers.authorization` instead of apiKeyEnv: pi-ai accepts a non-empty
+# authorization header as the API key, and our local proxy ignores the bearer
+# value. That avoids the MISSING_CREDENTIAL path where listModels() returns []
+# and the models are hidden from the picker.
+#
+# IMPORTANT — config is replaced WHOLESALE, never deep-merged:
+#   * Fresh / default users (no llm-pi-ai row in their own profile): this row
+#     wins and deveco models appear automatically. ✅
+#   * Users whose profile already configures llm-pi-ai: their layer is later
+#     and wins entirely, so they KEEP their own providers (fox-aws, etc.) and
+#     this bundle row is ignored. They should add the deveco block from
+#     config/dsh-provider.yml to their own config.providers once. See README.
+# ---------------------------------------------------------------------------
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      deveco:
+        displayName: DevEco Code
+        api: openai-completions
+        baseURL: http://127.0.0.1:17128/v2
+        headers:
+          authorization: Bearer deveco-local
+        models:
+          - id: GLM-5.3-DevEco
+            name: GLM-5.3 (DevEco)
+          - id: GLM-5.1-DevEco
+            name: GLM-5.1 (DevEco)
