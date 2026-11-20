@@ -1,0 +1,155 @@
+// Transparent image fallback: models the upstream declares as text-input-only
+// (plus anything named in DEVECO_TEXT_ONLY_MODELS) cannot consume image content
+// — DevEco rejects such requests with HTTP 403 / "Full inference timed out".
+// This module decides, per request, whether the turn must be rerouted to the
+// vision-capable model, and rewrites the OpenAI-shaped body accordingly.
+//
+// Rules (applied to the OpenAI wire shape, i.e. after the Anthropic transform
+// has already run for /anthropic/v1/messages):
+//   - vision-capable model + images            → untouched
+//   - text-only model + image in NEWEST user message → model replaced with
+//     DEVECO_VISION_FALLBACK_MODEL; tools/tool_choice removed (vision models
+//     do not emit structured tool calls)
+//   - text-only model + images only in history → model untouched, old image
+//     parts replaced with a "[图片]" text placeholder so the text model keeps
+//     the conversation without the payload it cannot see
+//   - text-only model + no images              → untouched
+import { DEVECO_TEXT_ONLY_MODELS, DEVECO_VISION_FALLBACK_MODEL, upstreamModelId, } from "./config.js";
+import { textOnlyModelsFromConfig } from "./models.js";
+export function visionModelId() {
+    return process.env.DEVECO_VISION_MODEL || DEVECO_VISION_FALLBACK_MODEL;
+}
+/**
+ * Models treated as unable to consume images. In order of precedence:
+ *
+ *   1. `DEVECO_TEXT_ONLY_MODELS`, when set — an explicit operator override;
+ *   2. the upstream model config's `input_modalities`, once cached — the
+ *      authoritative answer, so a model the upstream adds or changes needs no
+ *      code change here;
+ *   3. `DEVECO_TEXT_ONLY_MODELS` the constant — only while no config is cached
+ *      (cold start, offline, not logged in), where guessing beats rerouting
+ *      nothing.
+ */
+export function textOnlyModelIds() {
+    const override = process.env.DEVECO_TEXT_ONLY_MODELS;
+    if (override !== undefined && override.trim() !== "") {
+        return new Set(override
+            .split(",")
+            .map((s) => upstreamModelId(s.trim()))
+            .filter(Boolean));
+    }
+    return textOnlyModelsFromConfig() ?? new Set(DEVECO_TEXT_ONLY_MODELS);
+}
+function contentParts(msg) {
+    if (!msg || !Array.isArray(msg.content))
+        return [];
+    return msg.content.filter((p) => !!p && typeof p === "object" && "type" in p);
+}
+export function messageHasImage(msg) {
+    if (!msg || typeof msg !== "object")
+        return false;
+    return contentParts(msg).some((p) => p.type === "image_url");
+}
+export function anyMessageHasImage(messages) {
+    if (!Array.isArray(messages))
+        return false;
+    return messages.some((m) => messageHasImage(m));
+}
+/**
+ * Whether the current turn's input carries an image. The current turn is the
+ * message tail after the last assistant message (or all messages for a first
+ * turn). This covers both a user message with an image and a `tool` message
+ * that returned a screenshot as tool_result.
+ */
+export function currentTurnHasImage(messages) {
+    if (!Array.isArray(messages))
+        return false;
+    let lastAssistant = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        if (msg?.role === "assistant") {
+            lastAssistant = i;
+            break;
+        }
+    }
+    const start = lastAssistant === -1 ? 0 : lastAssistant + 1;
+    for (let i = start; i < messages.length; i++) {
+        if (messageHasImage(messages[i]))
+            return true;
+    }
+    return false;
+}
+/** Whether the newest user message carries an image. */
+export function newestUserMessageHasImage(messages) {
+    if (!Array.isArray(messages))
+        return false;
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        if (msg?.role === "user")
+            return messageHasImage(msg);
+    }
+    return false;
+}
+/** Replace image parts with a text placeholder, keeping everything else. */
+export function stripImages(messages) {
+    if (!Array.isArray(messages))
+        return messages;
+    return messages.map((m) => {
+        if (!m || typeof m !== "object")
+            return m;
+        const msg = m;
+        if (!Array.isArray(msg.content))
+            return m;
+        const content = msg.content.map((p) => {
+            if (p && typeof p === "object" && "type" in p && p.type === "image_url") {
+                return { type: "text", text: "[图片]" };
+            }
+            return p;
+        });
+        return { ...m, content };
+    });
+}
+/**
+ * Decide and apply the vision routing for one request body.
+ * Returns null when the body has no usable model id (caller forwards as-is).
+ */
+export function applyVisionRouting(body) {
+    const requestedModel = typeof body.model === "string" ? body.model : "";
+    if (!requestedModel)
+        return null;
+    const unchanged = {
+        body,
+        requestedModel,
+        upstreamModel: requestedModel,
+        rerouted: false,
+        imagesStripped: false,
+    };
+    if (!textOnlyModelIds().has(requestedModel))
+        return unchanged;
+    const messages = body.messages;
+    if (currentTurnHasImage(messages)) {
+        const fallback = visionModelId();
+        const routed = { ...body, model: fallback };
+        // The VL models DevEco exposes don't emit structured tool calls; dropping
+        // tools avoids the pseudo "<tool_call>...</tool_call>" text they return.
+        delete routed.tools;
+        delete routed.tool_choice;
+        return {
+            body: routed,
+            requestedModel,
+            upstreamModel: fallback,
+            rerouted: true,
+            imagesStripped: false,
+        };
+    }
+    if (anyMessageHasImage(messages)) {
+        return {
+            body: { ...body, messages: stripImages(messages) },
+            requestedModel,
+            upstreamModel: requestedModel,
+            rerouted: false,
+            imagesStripped: true,
+        };
+    }
+    return unchanged;
+}

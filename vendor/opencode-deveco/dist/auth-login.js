@@ -1,0 +1,611 @@
+// DevEco Code login flow: local HTTP callback server + token exchange.
+//
+// Ported from deveco-code packages/opencode/src/plugin/deveco.ts (lines ~280-769)
+// with all fork-internal dependencies removed:
+//   - no @/auth (saveAuthToDisk / loadAccessTokenFromDisk) — opencode auth is
+//     persisted via the plugin's client.auth.set instead
+//   - no @/security/local-crypto — jwtToken stored via the injected TokenStore
+//   - no Global.Path / GlobalBus / Log — uses config.log + node stdlib
+//
+// Public surface: createLoginService(tokenStore) -> { login, refreshToken, ... }.
+import { spawn } from "node:child_process";
+import crypto from "node:crypto";
+import http from "node:http";
+import { ACCESS_TOKEN_EXPIRES_MS, CALLBACK_PORTS, DEFAULT_CONFIG, log, } from "./config.js";
+import { envFetch } from "./env-fetch.js";
+import { describeNetworkError } from "./network-error.js";
+import { saveCountryRegion } from "./country-region.js";
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+export class LoginCancelledError extends Error {
+    constructor(message = "Login cancelled by user") {
+        super(message);
+        this.name = "LoginCancelledError";
+    }
+}
+export class UnsupportedRegionError extends Error {
+    constructor(message = "Unsupported region") {
+        super(message);
+        this.name = "UnsupportedRegionError";
+    }
+}
+/**
+ * DevEco has shipped both `realName: true` (boolean, current) and the string
+ * form "true"/"false" — normalise either to a boolean.
+ */
+export function parseRealName(value) {
+    if (typeof value === "boolean")
+        return value;
+    if (typeof value === "string")
+        return value === "true";
+    return false;
+}
+/** Chrome UA, as the upstream login client sends: some corporate gateways
+ * reject requests that do not look like a browser. */
+const LOGIN_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/**
+ * Auth-server fetch with transport failures translated into an actionable
+ * message. The raw error remains the cause and is logged by the caller.
+ */
+async function authFetch(url, init) {
+    try {
+        return await envFetch(url, init);
+    }
+    catch (err) {
+        const hint = describeNetworkError(err, url);
+        throw hint ? new Error(hint, { cause: err }) : err;
+    }
+}
+/**
+ * Read a login-server response as JSON, failing with something readable when a
+ * gateway answers with an HTML error page. The bare `res.json()` failure
+ * ("Unexpected token '<'") sends people hunting for a bug in the proxy instead
+ * of in their network.
+ */
+async function parseLoginJson(res) {
+    const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
+    const body = (await res.text()).trim();
+    if (contentType.includes("html") || /^\s*(<!doctype|<html)/i.test(body)) {
+        throw new Error(`auth server returned HTML instead of JSON (content-type: ${contentType || "unknown"}); a gateway or proxy error page likely intercepted the request`);
+    }
+    try {
+        return JSON.parse(body);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(`failed to parse the auth server response as JSON: ${msg}. Preview: ${body.slice(0, 200)}`, { cause: err });
+    }
+}
+/**
+ * Build the command that opens a URL in the default browser.
+ *
+ * Windows must go through cmd's `start`, which parses the command line itself:
+ * the login URL's `&` query separators would be read as command separators
+ * unless the URL stays double-quoted (node only auto-quotes arguments
+ * containing spaces, tabs or quotes — never `&`). macOS/Linux take the URL as
+ * a single argv with no shell in the way.
+ *
+ * Exported so the quoting can be tested off-Windows.
+ */
+export function browserOpenCommand(platform, url) {
+    if (platform === "win32")
+        return { command: `start "" "${url}"`, args: [], shell: true };
+    if (platform === "darwin")
+        return { command: "open", args: [url], shell: false };
+    return { command: "xdg-open", args: [url], shell: false };
+}
+function toLoginFailure(err) {
+    if (err instanceof LoginCancelledError) {
+        return { success: false, cancelled: true, error: err.message };
+    }
+    if (err instanceof UnsupportedRegionError) {
+        return {
+            success: false,
+            unsupportedRegion: true,
+            error: "Sorry, only China site accounts are currently supported",
+        };
+    }
+    log.error("login failed", { error: err instanceof Error ? err.message : String(err) });
+    return { success: false, error: err instanceof Error ? err.message : "Unknown error" };
+}
+// ---------------------------------------------------------------------------
+// LocalAuthServer — listens on 127.0.0.1 and receives the browser redirect.
+// ---------------------------------------------------------------------------
+class LocalAuthServer {
+    server = null;
+    port;
+    clientSecret;
+    callbackPath = "/callback";
+    resolveCallback = null;
+    rejectCallback = null;
+    timeoutId = null;
+    baseUrl;
+    successRedirectUrl;
+    failedRedirectUrl;
+    constructor(port, clientSecret, baseUrl, successRedirectUrl, failedRedirectUrl) {
+        this.port = port;
+        this.clientSecret = clientSecret;
+        this.baseUrl = baseUrl;
+        this.successRedirectUrl = successRedirectUrl;
+        this.failedRedirectUrl = failedRedirectUrl;
+    }
+    async start() {
+        const portsToTry = [this.port, ...CALLBACK_PORTS.filter((p) => p !== this.port)];
+        for (const port of portsToTry) {
+            try {
+                const actualPort = await this.tryPort(port);
+                this.port = actualPort;
+                return actualPort;
+            }
+            catch {
+                if (port === portsToTry[portsToTry.length - 1]) {
+                    throw new Error("All auth server ports are in use. Please free up a port or close other DevEco / opencode instances.");
+                }
+            }
+        }
+        throw new Error("Failed to start server");
+    }
+    tryPort(port) {
+        return new Promise((resolve, reject) => {
+            const server = http.createServer((req, res) => {
+                // A browser that closes the tab mid-callback would otherwise surface as
+                // an uncaught socket 'error' and take the whole proxy down with it.
+                req.on("error", (err) => log.debug("local auth server: request socket error", { error: String(err) }));
+                res.on("error", (err) => log.debug("local auth server: response socket error", { error: String(err) }));
+                this.handleRequest(req, res);
+            });
+            server.on("error", (err) => {
+                if (err.code === "EADDRINUSE")
+                    reject(new Error("Port is already in use"));
+                else
+                    reject(err);
+            });
+            server.listen(port, "127.0.0.1", () => {
+                this.server = server;
+                resolve(port);
+            });
+        });
+    }
+    waitForCallback(timeout = 30_000) {
+        return new Promise((resolve, reject) => {
+            this.resolveCallback = (value) => {
+                if (this.timeoutId) {
+                    clearTimeout(this.timeoutId);
+                    this.timeoutId = null;
+                }
+                resolve(value);
+            };
+            this.rejectCallback = (reason) => {
+                if (this.timeoutId) {
+                    clearTimeout(this.timeoutId);
+                    this.timeoutId = null;
+                }
+                reject(reason);
+            };
+            this.timeoutId = setTimeout(() => {
+                this.timeoutId = null;
+                this.rejectCallback?.(new Error("Callback timeout"));
+            }, timeout);
+        });
+    }
+    cancel() {
+        if (this.rejectCallback) {
+            this.rejectCallback(new LoginCancelledError("Login cancelled by user"));
+            this.rejectCallback = null;
+            this.resolveCallback = null;
+        }
+        if (this.timeoutId) {
+            clearTimeout(this.timeoutId);
+            this.timeoutId = null;
+        }
+    }
+    async stop() {
+        if (this.timeoutId) {
+            clearTimeout(this.timeoutId);
+            this.timeoutId = null;
+        }
+        return new Promise((resolve, reject) => {
+            if (!this.server) {
+                resolve();
+                return;
+            }
+            this.server.close((error) => {
+                if (error)
+                    reject(error);
+                else
+                    resolve();
+            });
+        });
+    }
+    handleRequest(req, res) {
+        const host = req.headers.host || `localhost:${this.port}`;
+        const url = new URL(req.url ?? "", `http://${host}`);
+        if (url.pathname !== this.callbackPath) {
+            res.writeHead(404);
+            res.end("Not Found");
+            return;
+        }
+        try {
+            const urlParams = url.searchParams;
+            if (req.method === "POST") {
+                let body = "";
+                req.on("data", (chunk) => {
+                    body += chunk.toString();
+                });
+                req.on("end", () => {
+                    this.handleCallbackRequest(res, urlParams, body);
+                });
+            }
+            else {
+                this.handleCallbackRequest(res, urlParams, "");
+            }
+        }
+        catch (err) {
+            res.writeHead(500);
+            res.end("Internal Server Error");
+            log.error("local auth server request error", { error: String(err) });
+            this.rejectCallback?.(err instanceof Error ? err : new Error(String(err)));
+        }
+    }
+    handleCallbackRequest(res, urlParams, body) {
+        try {
+            const params = body && body.trim() ? new URLSearchParams(body) : urlParams;
+            const code = params.get("code");
+            const tempToken = params.get("tempToken");
+            const siteId = params.get("siteId");
+            const quit = params.get("quit");
+            // code must match the clientSecret we generated for this session;
+            // a mismatch means the request isn't our callback — silently ignore.
+            if (!code || code !== this.clientSecret) {
+                log.warn("login callback: code mismatch or missing, ignoring");
+                return;
+            }
+            if (quit === "true" || quit === "access_denied") {
+                this.rejectCallback?.(new LoginCancelledError(quit === "access_denied" ? "Access denied by user" : "Login cancelled by user"));
+                res.writeHead(302, { Location: `${this.baseUrl}/${this.failedRedirectUrl}` });
+                res.end();
+                return;
+            }
+            if (!tempToken || !siteId) {
+                this.rejectCallback?.(new Error("Login cancelled by user"));
+                res.writeHead(302, { Location: `${this.baseUrl}/${this.failedRedirectUrl}` });
+                res.end();
+                return;
+            }
+            if (siteId !== "1") {
+                this.rejectCallback?.(new UnsupportedRegionError("Unsupported region"));
+                res.writeHead(302, { Location: `${this.baseUrl}/${this.failedRedirectUrl}` });
+                res.end();
+                return;
+            }
+            const callbackData = { tempToken, siteId, quit: quit ?? undefined };
+            this.resolveCallback?.(callbackData);
+            res.writeHead(302, { Location: `${this.baseUrl}/${this.successRedirectUrl}` });
+            res.end();
+        }
+        catch (err) {
+            res.writeHead(500);
+            res.end("Internal Server Error");
+            log.error("local auth server callback error", { error: String(err) });
+            this.rejectCallback?.(err instanceof Error ? err : new Error(String(err)));
+        }
+    }
+    getPort() {
+        return this.port;
+    }
+}
+// ---------------------------------------------------------------------------
+// LoginService
+// ---------------------------------------------------------------------------
+class LoginService {
+    config;
+    tokenStore;
+    server = null;
+    userInfo = null;
+    /**
+     * Bumped by cancel() and logout(). A login keeps the generation it started
+     * with and refuses to persist tokens when it no longer matches, so a login
+     * that finishes after the user signed out cannot resurrect the session (the
+     * upstream client guards the same race with a login-attempt generation).
+     */
+    loginAttempt = 0;
+    constructor(tokenStore, config) {
+        this.tokenStore = tokenStore;
+        this.config = { ...DEFAULT_CONFIG, ...config };
+    }
+    /**
+     * Begin a login and return the Huawei login URL *immediately*, alongside a
+     * promise that settles when the browser callback arrives (up to
+     * config.timeout later).
+     *
+     * Splitting the flow this way lets a caller hand the URL to whoever asked —
+     * e.g. redirect a browser straight to it — instead of blocking for the whole
+     * callback window. Set `openBrowser: false` when the caller will navigate to
+     * the URL itself.
+     */
+    async startLogin(opts = {}) {
+        const clientSecret = this.generateClientSecret();
+        const server = new LocalAuthServer(this.config.defaultPort, clientSecret, this.config.baseUrl, this.config.successRedirectUrl, this.config.failedRedirectUrl);
+        await server.start();
+        this.server = server;
+        // Arm the callback promise BEFORE the login page can be reached, so
+        // resolveCallback/rejectCallback are ready the instant a request lands.
+        const callbackPromise = server.waitForCallback(this.config.timeout);
+        const url = this.buildLoginUrl(server.getPort(), clientSecret);
+        this.validateLoginUrl(url);
+        if (opts.openBrowser !== false)
+            this.openLoginPage(url);
+        const attempt = ++this.loginAttempt;
+        const result = this.finishLogin(callbackPromise, attempt).finally(async () => {
+            await server.stop().catch(() => { });
+            if (this.server === server)
+                this.server = null;
+        });
+        return { url, result };
+    }
+    async login() {
+        try {
+            const { result } = await this.startLogin();
+            return await result;
+        }
+        catch (err) {
+            return toLoginFailure(err);
+        }
+    }
+    async finishLogin(callbackPromise, attempt) {
+        try {
+            const callbackData = await callbackPromise;
+            const jwtToken = await this.getJwtToken(callbackData.tempToken);
+            const userInfo = await this.getUserInfoFromJwt(jwtToken);
+            // The user may have signed out (or cancelled) while the tokens were being
+            // fetched; persisting them now would undo that.
+            if (attempt !== this.loginAttempt) {
+                log.warn("login finished after being superseded; discarding the tokens");
+                return { success: false, cancelled: true, error: "Login was superseded" };
+            }
+            await this.tokenStore.save(jwtToken);
+            this.userInfo = userInfo;
+            // Same convenience side effect as the upstream client: DevEco Studio
+            // reads this file to share the user's country setting. A failure must
+            // never turn a successful login into a failed one.
+            try {
+                await saveCountryRegion(userInfo.countryCode);
+            }
+            catch (err) {
+                log.warn("failed to write country region file", { error: String(err) });
+            }
+            return { success: true, userInfo, jwtToken };
+        }
+        catch (err) {
+            return toLoginFailure(err);
+        }
+    }
+    cancel() {
+        this.loginAttempt++;
+        this.server?.cancel();
+    }
+    async isLoggedIn() {
+        if (this.userInfo)
+            return true;
+        const token = await this.tokenStore.load();
+        return token !== null;
+    }
+    getUserInfo() {
+        return this.userInfo;
+    }
+    async logout() {
+        // Supersede any login still in flight, so it cannot write its tokens back.
+        this.loginAttempt++;
+        await this.tokenStore.clear();
+        this.userInfo = null;
+    }
+    generateClientSecret() {
+        return crypto.randomUUID().replace(/-/g, "");
+    }
+    buildLoginUrl(port, clientSecret) {
+        return `${this.config.baseUrl}/${this.config.authUrl}?port=${port}&appid=${this.config.appId}&code=${clientSecret}`;
+    }
+    /**
+     * Reject a login URL before it reaches the OS launcher. `new URL` leaves `$`
+     * and backticks in place, which stay active in the Windows launcher's
+     * PowerShell `Start "..."` string — so both the scheme and the character set
+     * are explicitly allowlisted.
+     */
+    validateLoginUrl(loginUrl) {
+        const parsed = new URL(loginUrl);
+        if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+            throw new Error(`Unsupported login URL scheme: ${parsed.protocol}`);
+        }
+        if (!/^[A-Za-z0-9._~:/?=&%#@+-]+$/.test(parsed.href)) {
+            throw new Error("Login URL contains disallowed characters");
+        }
+    }
+    /**
+     * Best-effort browser open. Never blocks and never throws: when the proxy
+     * runs as a background service there may be no desktop session to open into
+     * (no DISPLAY), and the caller falls back to handing the URL to its client.
+     */
+    openLoginPage(loginUrl) {
+        // Never log the clientSecret embedded in the login URL.
+        const safeUrl = loginUrl.replace(/code=[^&]*/g, "code=***");
+        const { command, args, shell } = browserOpenCommand(process.platform, loginUrl);
+        try {
+            // detached + ignored stdio: a browser that outlives this call must not
+            // keep us waiting on its pipes.
+            const child = spawn(command, args, {
+                detached: true,
+                stdio: "ignore",
+                shell,
+                windowsHide: true,
+            });
+            child.on("error", (err) => log.warn("could not open login page in a browser; open the URL manually", {
+                command,
+                url: safeUrl,
+                error: String(err),
+            }));
+            child.unref();
+        }
+        catch (err) {
+            log.warn("could not open login page in a browser; open the URL manually", {
+                url: safeUrl,
+                error: String(err),
+            });
+        }
+    }
+    async getJwtToken(tempToken) {
+        const actualTempToken = tempToken.split("&")[0];
+        const params = new URLSearchParams({
+            tempToken: actualTempToken,
+            site: "CN",
+            version: "1.0.0",
+            appid: this.config.appId,
+        });
+        const url = `${this.config.baseUrl}/${this.config.tempTokenCheckUrl}?${params}`;
+        const res = await authFetch(url, {
+            signal: AbortSignal.timeout(20_000),
+            headers: { "User-Agent": LOGIN_USER_AGENT, "accept-language": "zh-CN" },
+        });
+        if (!res.ok) {
+            log.error("failed to get jwtToken", { statusCode: res.status });
+            throw new Error(`Failed to get jwtToken: ${res.status}`);
+        }
+        const jwtToken = (await res.text()).trim();
+        if (jwtToken.split(".").length !== 3) {
+            log.error("invalid jwtToken format received", { tokenLength: jwtToken.length });
+            throw new Error("Invalid jwtToken format");
+        }
+        return jwtToken;
+    }
+    async getUserInfoFromJwt(jwtToken) {
+        const tokenInfo = await this.checkJwtToken(jwtToken);
+        if (!tokenInfo.status || !tokenInfo.userInfo) {
+            log.error("invalid jwtToken: missing userInfo", { status: tokenInfo.status });
+            throw new Error("Invalid jwtToken: missing userInfo");
+        }
+        // The upstream client refuses a non-China account during login; doing the
+        // same here gives the user an actionable message instead of a successful
+        // sign-in followed by a 403 on the first inference request.
+        const nationalCode = tokenInfo.userInfo.nationalCode?.trim().toUpperCase();
+        if (nationalCode && nationalCode !== "CN") {
+            throw new UnsupportedRegionError("Unsupported account region");
+        }
+        const jwtPayload = parseJwt(jwtToken);
+        const userInfo = {
+            userId: jwtPayload.userId,
+            userName: jwtPayload.userName,
+            accessToken: tokenInfo.userInfo.accessToken,
+            refreshToken: tokenInfo.userInfo.refreshToken ?? "",
+            jwtToken,
+            // The account's real region, normalised the way the upstream login
+            // service does. Hardcoding "CN" here would let a non-China account
+            // through the region gate and fail upstream instead.
+            countryCode: nationalCode || "CN",
+            language: "zh_CN",
+            isRealName: parseRealName(tokenInfo.userInfo.realName),
+        };
+        return userInfo;
+    }
+    async checkJwtToken(jwtToken) {
+        const url = `${this.config.baseUrl}/${this.config.jwtTokenCheckUrl}`;
+        const res = await authFetch(url, {
+            signal: AbortSignal.timeout(20_000),
+            headers: { refresh: "false", jwtToken, "User-Agent": LOGIN_USER_AGENT, "accept-language": "zh-CN" },
+        });
+        if (!res.ok) {
+            log.error("failed to check jwtToken", { statusCode: res.status });
+            throw new Error(`Failed to check jwtToken: ${res.status}`);
+        }
+        return parseLoginJson(res);
+    }
+    /**
+     * Refresh the accessToken using the stored jwtToken.
+     * Returns new access/refresh tokens, or null on failure.
+     */
+    async refreshToken(jwtToken) {
+        // If the JWT itself has already expired, refreshing will always fail — skip
+        // the network call and let the caller prompt a fresh login.
+        try {
+            const exp = parseJwt(jwtToken).exp;
+            if (exp && Date.now() >= exp * 1000)
+                return null;
+        }
+        catch {
+            /* unparseable JWT — let the server decide */
+        }
+        const url = `${this.config.baseUrl}/${this.config.jwtTokenCheckUrl}`;
+        try {
+            const res = await authFetch(url, {
+                signal: AbortSignal.timeout(20_000),
+                headers: { refresh: "true", jwtToken, "User-Agent": LOGIN_USER_AGENT, "accept-language": "zh-CN" },
+            });
+            if (!res.ok) {
+                log.error(`refreshToken failed: HTTP ${res.status}`);
+                return null;
+            }
+            const result = await parseLoginJson(res);
+            if (!result.status || !result.userInfo) {
+                log.error("refreshToken failed: invalid response", { status: result.status });
+                return null;
+            }
+            return {
+                accessToken: result.userInfo.accessToken,
+                refreshToken: result.userInfo.refreshToken ?? "",
+                isRealName: parseRealName(result.userInfo.realName),
+            };
+        }
+        catch (err) {
+            log.error(`refreshToken error: ${String(err)}`);
+            return null;
+        }
+    }
+}
+/** Decode the JWT payload (no signature verification — DevEco issues these). */
+export function parseJwt(token) {
+    const parts = token.split(".");
+    if (parts.length !== 3)
+        throw new Error("Invalid jwtToken format");
+    const base64Url = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const base64 = base64Url.padEnd(base64Url.length + ((4 - (base64Url.length % 4)) % 4), "=");
+    const json = Buffer.from(base64, "base64").toString("utf8");
+    const parsed = JSON.parse(json);
+    return {
+        userId: typeof parsed.userId === "string" ? parsed.userId : "",
+        userName: typeof parsed.userName === "string" ? parsed.userName : "",
+        exp: typeof parsed.exp === "number" ? parsed.exp : undefined,
+        iat: typeof parsed.iat === "number" ? parsed.iat : undefined,
+        nationalCode: typeof parsed.nationalCode === "string" ? parsed.nationalCode : undefined,
+        isRealName: typeof parsed.isRealName === "boolean" ? parsed.isRealName : undefined,
+    };
+}
+/**
+ * Rebuild the signed-in identity from the stored jwtToken plus a fresh token
+ * pair. A headless refresh returns only tokens — never a profile — so a session
+ * restored at startup would otherwise report `logged_in` with a null user.
+ *
+ * Identity fields come straight out of the jwtToken payload; `language` is
+ * fixed the same way the interactive login fixes it. Returns null for an
+ * unparseable token rather than throwing, since this is only display data.
+ */
+export function userInfoFromJwt(jwtToken, tokens) {
+    try {
+        const payload = parseJwt(jwtToken);
+        return {
+            userId: payload.userId,
+            userName: payload.userName,
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken,
+            jwtToken,
+            countryCode: payload.nationalCode ?? "CN",
+            language: "zh_CN",
+            isRealName: payload.isRealName ?? false,
+        };
+    }
+    catch {
+        return null;
+    }
+}
+export function createLoginService(tokenStore, config) {
+    return new LoginService(tokenStore, config);
+}
+export { ACCESS_TOKEN_EXPIRES_MS };

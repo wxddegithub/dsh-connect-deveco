@@ -1,0 +1,631 @@
+// Anthropic Messages API ↔ OpenAI Chat Completions bidirectional transform.
+//
+// Adapts the protocol translation from cc-haha (cc-switch, Jason Young, MIT)
+// for the opencode-deveco proxy use case. Strips DeepSeek/Responses-API
+// specifics; focuses on OpenAI Chat Completions format used by DevEco.
+// ─── Request transform: Anthropic → OpenAI Chat ──────────────
+export function anthropicToOpenaiChat(body) {
+    const messages = [];
+    // System prompt
+    if (body.system) {
+        const text = typeof body.system === "string"
+            ? body.system
+            : body.system.map((b) => b.text).filter(Boolean).join("\n");
+        if (text) {
+            messages.push({ role: "system", content: text });
+        }
+    }
+    // Messages
+    for (const msg of body.messages) {
+        convertMessage(msg, messages);
+    }
+    const result = {
+        model: body.model,
+        messages,
+        stream: body.stream === true,
+    };
+    if (result.stream) {
+        result.stream_options = { include_usage: true };
+    }
+    if (body.max_tokens !== undefined)
+        result.max_tokens = body.max_tokens;
+    if (body.temperature !== undefined)
+        result.temperature = body.temperature;
+    if (body.top_p !== undefined)
+        result.top_p = body.top_p;
+    if (body.stop_sequences?.length) {
+        result.stop = body.stop_sequences;
+    }
+    // Tools. DevEco's tool_choice is an enum that only accepts "auto" | "none" |
+    // "required" — the OpenAI object form makes it reject the whole request — so
+    // "use exactly this tool" is emulated by requiring a call and offering only
+    // that tool.
+    const forcedTool = forcedToolName(body.tool_choice);
+    if (body.tools?.length) {
+        result.tools = body.tools
+            .filter((t) => t.name !== "BatchTool")
+            .filter((t) => !forcedTool || t.name === forcedTool)
+            .map((t) => ({
+            type: "function",
+            function: {
+                name: t.name,
+                description: t.description,
+                parameters: t.input_schema,
+            },
+        }));
+    }
+    if (body.tool_choice !== undefined) {
+        result.tool_choice = convertToolChoice(body.tool_choice);
+    }
+    // DevEco would reject tool_choice:"required" with no tools to call. This can
+    // happen when the client forces a tool that isn't in body.tools (or all
+    // tools were filtered out) — degrade to no constraint instead of a 400.
+    if (result.tool_choice === "required" && (!result.tools || result.tools.length === 0)) {
+        delete result.tool_choice;
+    }
+    // thinking → reasoning_effort
+    if (body.thinking) {
+        const budget = body.thinking.budget_tokens;
+        if (budget !== undefined) {
+            if (budget <= 1024)
+                result.reasoning_effort = "low";
+            else if (budget <= 8192)
+                result.reasoning_effort = "medium";
+            else
+                result.reasoning_effort = "high";
+        }
+        else if (body.thinking.type === "enabled") {
+            result.reasoning_effort = "high";
+        }
+    }
+    return result;
+}
+function convertMessage(msg, output) {
+    const content = msg.content;
+    if (typeof content === "string") {
+        output.push({ role: msg.role, content });
+        return;
+    }
+    if (!Array.isArray(content) || content.length === 0) {
+        output.push({ role: msg.role, content: "" });
+        return;
+    }
+    if (msg.role === "user") {
+        convertUserMessage(content, output);
+    }
+    else {
+        convertAssistantMessage(content, output);
+    }
+}
+function convertUserMessage(blocks, output) {
+    const contentParts = [];
+    for (const block of blocks) {
+        if (block.type === "text") {
+            contentParts.push({ type: "text", text: block.text });
+        }
+        else if (block.type === "image") {
+            const url = `data:${block.source.media_type};base64,${block.source.data}`;
+            contentParts.push({ type: "image_url", image_url: { url } });
+        }
+        else if (block.type === "tool_result") {
+            // Preserve tool-result images: they may be screenshots the vision model
+            // needs to see (e.g. UI verification). Text-only tool results still use
+            // a plain string so they stay compatible with strict OpenAI clients.
+            const toolParts = [];
+            if (typeof block.content === "string") {
+                if (block.content)
+                    toolParts.push({ type: "text", text: block.content });
+            }
+            else if (Array.isArray(block.content)) {
+                for (const b of block.content) {
+                    if (b.type === "text") {
+                        toolParts.push({ type: "text", text: b.text });
+                    }
+                    else if (b.type === "image") {
+                        const url = `data:${b.source.media_type};base64,${b.source.data}`;
+                        toolParts.push({ type: "image_url", image_url: { url } });
+                    }
+                }
+            }
+            const toolContent = toolParts.length === 1 && toolParts[0].type === "text"
+                ? toolParts[0].text
+                : toolParts;
+            output.push({
+                role: "tool",
+                tool_call_id: block.tool_use_id,
+                content: toolContent,
+            });
+        }
+    }
+    if (contentParts.length > 0) {
+        output.push({
+            role: "user",
+            content: contentParts.length === 1 && contentParts[0].type === "text"
+                ? contentParts[0].text
+                : contentParts,
+        });
+    }
+}
+function convertAssistantMessage(blocks, output) {
+    let textContent = "";
+    const toolCalls = [];
+    for (const block of blocks) {
+        if (block.type === "text") {
+            textContent += block.text;
+        }
+        else if (block.type === "tool_use") {
+            toolCalls.push({
+                id: block.id,
+                type: "function",
+                function: {
+                    name: block.name,
+                    arguments: typeof block.input === "string" ? block.input : JSON.stringify(block.input),
+                },
+            });
+        }
+    }
+    const msg = {
+        role: "assistant",
+        content: textContent || null,
+    };
+    if (toolCalls.length > 0) {
+        msg.tool_calls = toolCalls;
+    }
+    output.push(msg);
+}
+/** The tool name an Anthropic `{type:"tool"}` choice pins the model to, if any. */
+export function forcedToolName(choice) {
+    if (typeof choice !== "object" || choice === null)
+        return null;
+    const c = choice;
+    return c.type === "tool" && typeof c.name === "string" ? c.name : null;
+}
+export function convertToolChoice(choice) {
+    if (typeof choice === "string")
+        return choice;
+    if (typeof choice === "object" && choice !== null) {
+        const c = choice;
+        if (c.type === "auto")
+            return "auto";
+        if (c.type === "any")
+            return "required";
+        if (c.type === "none")
+            return "none";
+        // Never the OpenAI `{type:"function", ...}` object here: DevEco fails the
+        // request with a ToolChoiceMode deserialisation error. The tools list is
+        // narrowed to this one tool instead (see anthropicToOpenaiChat).
+        if (c.type === "tool" && typeof c.name === "string")
+            return "required";
+    }
+    return "auto";
+}
+// ─── Response transform: OpenAI Chat → Anthropic ─────────────
+export function openaiChatToAnthropic(response, model) {
+    const choice = response.choices?.[0];
+    if (!choice) {
+        return {
+            id: response.id || `msg_${Date.now()}`,
+            type: "message",
+            role: "assistant",
+            content: [{ type: "text", text: "" }],
+            model: response.model || model,
+            stop_reason: "end_turn",
+            stop_sequence: null,
+            usage: mapUsage(response.usage),
+        };
+    }
+    const content = [];
+    const msg = choice.message;
+    // Reasoning content (GLM-5.1 uses `reasoning` field)
+    if (typeof msg.reasoning_content === "string" && msg.reasoning_content) {
+        content.push({ type: "thinking", thinking: msg.reasoning_content });
+    }
+    else if (typeof msg.reasoning === "string" && msg.reasoning) {
+        content.push({ type: "thinking", thinking: msg.reasoning });
+    }
+    if (choice.message.content) {
+        content.push({ type: "text", text: choice.message.content });
+    }
+    if (choice.message.tool_calls) {
+        for (const tc of choice.message.tool_calls) {
+            let input;
+            if (typeof tc.function.arguments === "string") {
+                try {
+                    input = JSON.parse(tc.function.arguments);
+                }
+                catch {
+                    input = { raw: tc.function.arguments };
+                }
+            }
+            else {
+                input = tc.function.arguments ?? {};
+            }
+            content.push({ type: "tool_use", id: tc.id, name: tc.function.name, input });
+        }
+    }
+    if (content.length === 0) {
+        content.push({ type: "text", text: "" });
+    }
+    return {
+        id: response.id || `msg_${Date.now()}`,
+        type: "message",
+        role: "assistant",
+        content,
+        model: response.model || model,
+        stop_reason: mapFinishReason(choice.finish_reason),
+        stop_sequence: null,
+        usage: mapUsage(response.usage),
+    };
+}
+function mapFinishReason(reason) {
+    switch (reason) {
+        case "stop": return "end_turn";
+        case "tool_calls": return "tool_use";
+        case "length": return "max_tokens";
+        case "content_filter": return "end_turn";
+        default: return "end_turn";
+    }
+}
+function mapUsage(usage) {
+    if (!usage)
+        return { input_tokens: 0, output_tokens: 0 };
+    const input = usage.prompt_tokens ?? 0;
+    const output = usage.completion_tokens ?? 0;
+    const cacheRead = usage.prompt_tokens_details?.cached_tokens ?? 0;
+    const result = {
+        input_tokens: cacheRead > 0 ? Math.max(0, input - cacheRead) : input,
+        output_tokens: output,
+    };
+    if (cacheRead > 0)
+        result.cache_read_input_tokens = cacheRead;
+    return result;
+}
+function formatSse(event, data) {
+    return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+function createState(model) {
+    return {
+        queue: [],
+        currentBlockType: "text",
+        currentBlockIndex: -1,
+        nextContentIndex: 0,
+        blockStartSent: false,
+        blockStopSent: false,
+        toolBlocks: new Map(),
+        model,
+        messageStartSent: false,
+        messageDeltaSent: false,
+        messageStopSent: false,
+        heldMessageDelta: null,
+    };
+}
+export function openaiChatStreamToAnthropic(upstream, model, onUpstreamChunk) {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const state = createState(model);
+    let reader = null;
+    return new ReadableStream({
+        async start(controller) {
+            const r = upstream.getReader();
+            reader = r;
+            try {
+                while (true) {
+                    const { done, value } = await r.read();
+                    if (done)
+                        break;
+                    // Signals liveness to the caller's idle watchdog. Must fire per raw
+                    // upstream chunk, not per emitted event: keep-alives and partial
+                    // lines produce no output but still mean the backend is alive.
+                    onUpstreamChunk?.();
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split("\n");
+                    buffer = lines.pop() || "";
+                    for (const line of lines) {
+                        const trimmed = line.trim();
+                        if (!trimmed || trimmed.startsWith(":"))
+                            continue;
+                        if (trimmed === "data: [DONE]") {
+                            finalizeStream(state);
+                            flushQueue(state, controller, encoder);
+                            continue;
+                        }
+                        if (!trimmed.startsWith("data: "))
+                            continue;
+                        let chunk;
+                        try {
+                            chunk = JSON.parse(trimmed.slice(6));
+                        }
+                        catch {
+                            continue;
+                        }
+                        processChunk(chunk, state);
+                        flushQueue(state, controller, encoder);
+                    }
+                }
+            }
+            catch (err) {
+                // The upstream died mid-turn (timeout, reset, abort). Erroring the
+                // stream here would leave the client with a truncated SSE and no clue
+                // why, so close the open blocks and hand it a real Anthropic `error`
+                // event, which every client surfaces as an actual message.
+                emitError(state, controller, encoder, err);
+                return;
+            }
+            // Both paths guard the emit: the consumer may have cancelled the stream
+            // mid-flight (client disconnect), in which case the controller is
+            // already closed and every enqueue would throw.
+            try {
+                finalizeStream(state);
+                flushQueue(state, controller, encoder);
+                controller.close();
+            }
+            catch {
+                /* consumer already gone; nothing left to emit */
+            }
+        },
+        // The consumer went away (client disconnect). Cancel the upstream read
+        // loop so the backend connection isn't drained into a dead stream.
+        cancel() {
+            reader?.cancel().catch(() => { });
+        },
+    });
+}
+function emitError(state, controller, encoder, err) {
+    try {
+        closeAllOpenBlocks(state);
+        flushQueue(state, controller, encoder);
+        controller.enqueue(encoder.encode(formatSse("error", {
+            type: "error",
+            error: {
+                type: "api_error",
+                message: `Upstream stream ended early: ${err instanceof Error ? err.message : String(err)}`,
+            },
+        })));
+        controller.close();
+    }
+    catch {
+        /* consumer already gone; no output possible */
+    }
+}
+// ─── Stream internals ────────────────────────────────────────
+function enqueue(state, event, data) {
+    state.queue.push({ event, data });
+}
+function flushQueue(state, controller, encoder) {
+    for (const item of state.queue) {
+        controller.enqueue(encoder.encode(formatSse(item.event, item.data)));
+    }
+    state.queue.length = 0;
+}
+function ensureMessageStart(state, chunkId, usage) {
+    if (state.messageStartSent)
+        return;
+    state.messageStartSent = true;
+    const promptTokens = usage?.prompt_tokens ?? 0;
+    const cachedRead = usage?.prompt_tokens_details?.cached_tokens ?? 0;
+    enqueue(state, "message_start", {
+        type: "message_start",
+        message: {
+            id: chunkId || `msg_${Date.now()}`,
+            type: "message",
+            role: "assistant",
+            content: [],
+            model: state.model,
+            stop_reason: null,
+            stop_sequence: null,
+            // DevEco sends usage in the first streaming chunk too, so use it here
+            // instead of leaving input_tokens at 0 (the Anthropic message_delta
+            // usage only carries output_tokens). Mirror the non-stream mapper: cached
+            // prompt tokens are reported as cache_read_input_tokens and subtracted
+            // from input_tokens.
+            usage: {
+                input_tokens: cachedRead > 0 ? Math.max(0, promptTokens - cachedRead) : promptTokens,
+                output_tokens: 0,
+                ...(cachedRead > 0 ? { cache_read_input_tokens: cachedRead } : {}),
+            },
+        },
+    });
+}
+function openBlock(state, blockType, block) {
+    const index = state.nextContentIndex++;
+    state.currentBlockType = blockType;
+    state.currentBlockIndex = index;
+    state.blockStartSent = true;
+    state.blockStopSent = false;
+    enqueue(state, "content_block_start", {
+        type: "content_block_start",
+        index,
+        content_block: block,
+    });
+    return index;
+}
+function emitDelta(state, index, delta) {
+    enqueue(state, "content_block_delta", { type: "content_block_delta", index, delta });
+}
+function closeCurrentBlock(state) {
+    if (!state.blockStartSent || state.blockStopSent)
+        return;
+    state.blockStopSent = true;
+    enqueue(state, "content_block_stop", { type: "content_block_stop", index: state.currentBlockIndex });
+}
+function closeAllToolBlocks(state) {
+    for (const [, block] of state.toolBlocks) {
+        if (block.started) {
+            enqueue(state, "content_block_stop", { type: "content_block_stop", index: block.anthropicIndex });
+        }
+    }
+    state.toolBlocks.clear();
+    if (state.currentBlockType === "tool_use") {
+        state.blockStopSent = true;
+    }
+}
+function closeAllOpenBlocks(state) {
+    if (state.currentBlockType !== "tool_use") {
+        closeCurrentBlock(state);
+    }
+    closeAllToolBlocks(state);
+}
+function extractReasoning(delta) {
+    if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+        return { thinking: delta.reasoning_content };
+    }
+    if (typeof delta.reasoning === "string" && delta.reasoning) {
+        return { thinking: delta.reasoning };
+    }
+    return null;
+}
+function processChunk(chunk, state) {
+    // Keep the model the client asked for: message_start must report the
+    // requested id (e.g. GLM-5.1), not the backend's internal model name
+    // (GLM5_1_W4A8_PD-1.0.0) or a vision-rerouted fallback.
+    const choice = chunk.choices?.[0];
+    if (!choice) {
+        if (chunk.usage && state.heldMessageDelta) {
+            mergeUsageIntoHeldDelta(state, chunk.usage);
+        }
+        return;
+    }
+    ensureMessageStart(state, chunk.id, chunk.usage);
+    const delta = choice.delta;
+    const toolCalls = delta.tool_calls;
+    const hasToolCalls = toolCalls && toolCalls.length > 0;
+    const hasText = delta.content != null && delta.content !== "";
+    const reasoning = extractReasoning(delta);
+    if (hasToolCalls) {
+        const isNew = state.currentBlockType !== "tool_use" || !!(toolCalls[0]?.function?.name);
+        if (isNew && state.blockStartSent && !state.blockStopSent) {
+            if (state.currentBlockType !== "tool_use")
+                closeCurrentBlock(state);
+        }
+        handleToolCalls(toolCalls, state);
+    }
+    else if (hasText) {
+        const isNew = state.currentBlockType !== "text" || !state.blockStartSent;
+        if (isNew && state.blockStartSent && !state.blockStopSent) {
+            if (state.currentBlockType === "tool_use")
+                closeAllToolBlocks(state);
+            else
+                closeCurrentBlock(state);
+        }
+        handleText(delta, state);
+    }
+    else if (reasoning) {
+        const isNew = state.currentBlockType !== "thinking" || !state.blockStartSent;
+        if (isNew && state.blockStartSent && !state.blockStopSent) {
+            if (state.currentBlockType === "tool_use")
+                closeAllToolBlocks(state);
+            else
+                closeCurrentBlock(state);
+        }
+        handleThinking(reasoning, state);
+    }
+    if (choice.finish_reason) {
+        handleFinishReason(choice.finish_reason, chunk, state);
+    }
+}
+function handleText(delta, state) {
+    if (delta.content == null || delta.content === "")
+        return;
+    if (state.currentBlockType !== "text" || !state.blockStartSent) {
+        openBlock(state, "text", { type: "text", text: "" });
+    }
+    emitDelta(state, state.currentBlockIndex, { type: "text_delta", text: delta.content });
+}
+function handleThinking(reasoning, state) {
+    if (state.currentBlockType !== "thinking" || !state.blockStartSent) {
+        openBlock(state, "thinking", { type: "thinking", thinking: "" });
+    }
+    emitDelta(state, state.currentBlockIndex, { type: "thinking_delta", thinking: reasoning.thinking });
+}
+function handleToolCalls(toolCalls, state) {
+    if (!toolCalls)
+        return;
+    for (const tc of toolCalls) {
+        const tcIndex = tc.index;
+        if (!state.toolBlocks.has(tcIndex)) {
+            state.toolBlocks.set(tcIndex, { id: "", name: "", argsBuffer: "", started: false, anthropicIndex: -1 });
+        }
+        const block = state.toolBlocks.get(tcIndex);
+        if (tc.id)
+            block.id = tc.id;
+        if (tc.function?.name)
+            block.name += tc.function.name;
+        if (tc.function?.arguments)
+            block.argsBuffer += tc.function.arguments;
+        if (!block.started && block.id && block.name) {
+            block.started = true;
+            block.anthropicIndex = state.nextContentIndex++;
+            state.currentBlockType = "tool_use";
+            state.currentBlockIndex = block.anthropicIndex;
+            state.blockStartSent = true;
+            state.blockStopSent = false;
+            enqueue(state, "content_block_start", {
+                type: "content_block_start",
+                index: block.anthropicIndex,
+                content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+            });
+            if (block.argsBuffer) {
+                emitDelta(state, block.anthropicIndex, { type: "input_json_delta", partial_json: block.argsBuffer });
+            }
+        }
+        else if (block.started && tc.function?.arguments) {
+            emitDelta(state, block.anthropicIndex, { type: "input_json_delta", partial_json: tc.function.arguments });
+        }
+    }
+}
+function handleFinishReason(finishReason, chunk, state) {
+    if (state.messageDeltaSent)
+        return;
+    closeAllOpenBlocks(state);
+    const stopReason = mapFinishReason(finishReason);
+    const usage = chunk.usage
+        ? { output_tokens: chunk.usage.completion_tokens ?? 0 }
+        : { output_tokens: 0 };
+    const messageDelta = {
+        event: "message_delta",
+        data: {
+            type: "message_delta",
+            delta: { stop_reason: stopReason, stop_sequence: null },
+            usage,
+        },
+    };
+    if (chunk.usage) {
+        state.messageDeltaSent = true;
+        state.queue.push(messageDelta);
+    }
+    else {
+        state.heldMessageDelta = messageDelta;
+    }
+}
+function mergeUsageIntoHeldDelta(state, usage) {
+    if (!state.heldMessageDelta)
+        return;
+    const data = state.heldMessageDelta.data;
+    const usageData = data.usage;
+    usageData.output_tokens = usage.completion_tokens ?? 0;
+    state.messageDeltaSent = true;
+    state.queue.push(state.heldMessageDelta);
+    state.heldMessageDelta = null;
+}
+function finalizeStream(state) {
+    if (state.messageStopSent)
+        return;
+    state.messageStopSent = true;
+    ensureMessageStart(state);
+    closeAllOpenBlocks(state);
+    if (state.heldMessageDelta && !state.messageDeltaSent) {
+        state.messageDeltaSent = true;
+        state.queue.push(state.heldMessageDelta);
+        state.heldMessageDelta = null;
+    }
+    if (!state.messageDeltaSent) {
+        state.messageDeltaSent = true;
+        enqueue(state, "message_delta", {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn", stop_sequence: null },
+            usage: { output_tokens: 0 },
+        });
+    }
+    enqueue(state, "message_stop", { type: "message_stop" });
+}

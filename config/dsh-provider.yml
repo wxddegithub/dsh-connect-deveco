@@ -1,0 +1,21 @@
+# ---------------------------------------------------------------------------
+# DSH provider snippet — paste this into your profile's
+#   llm-pi-ai config.providers
+# (normally ~/.dsh/profiles/<profile>/cordis.patch.yml, under the
+#  `@deepseek-ai/dsh-llm-pi-ai` service block's `config.providers`).
+#
+# This registers the `deveco` provider that talks to the local proxy this
+# plugin manages. It is a plain provider entry — no personal data, no account
+# credentials, no API key. The proxy ignores the bearer token; the placeholder
+# key only needs to be a non-empty string so DSH accepts the provider.
+# ---------------------------------------------------------------------------
+deveco:
+  displayName: DevEco Code
+  apiKeyEnv: DEVECO_DUMMY_KEY
+  api: openai-completions
+  baseURL: http://127.0.0.1:17128/v2
+  models:
+    - id: GLM-5.3-DevEco
+      name: GLM-5.3 (DevEco)
+    - id: GLM-5.1-DevEco
+      name: GLM-5.1 (DevEco)

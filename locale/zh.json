@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DevEco Code 代理",
+    "description": "管理支撑 deveco GLM 提供方的本地 opencode-deveco 代理：输入框下方实时状态胶囊（已登录/授权已过期/未登录三态）、开始/停止/重启、华为登录与登出、到期时间、看门狗自愈，并注册 deveco_proxy 智能体工具。"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DevEco Code proxy",
+    "description": "Manages the local opencode-deveco proxy behind the deveco GLM provider: a live status chip with three account states (signed in / authorization expired / logged out), start/stop/restart, Huawei login and logout, expiry time, a self-healing watchdog, and the deveco_proxy agent tool."
+  }
+}

@@ -1,0 +1,13 @@
+# Runtime artifacts produced by the vendored opencode-deveco proxy
+proxy.log
+proxy.log.err
+proxy-daemon.pid
+*.pid
+
+# Huawei credentials — NEVER commit
+jwt.json
+
+# Node / OS noise
+node_modules/.cache/
+.DS_Store
+Thumbs.db

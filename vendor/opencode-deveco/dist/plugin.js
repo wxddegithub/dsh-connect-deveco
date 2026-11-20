@@ -1,0 +1,416 @@
+// The opencode-deveco plugin entry (hybrid architecture).
+//
+// The published opencode binary does NOT load external plugins' auth hooks, so
+// this plugin cannot inject the DevEco Bearer token directly. Instead it uses a
+// HYBRID approach:
+//
+//   1. On load, it starts a LOCAL PROXY server (DevEcoProxy) that holds the
+//      DevEco credentials and forwards requests to the real DevEco backend.
+//   2. The config hook injects a `deveco` provider whose baseURL points at the
+//      local proxy. opencode then sends normal OpenAI-style requests to the
+//      proxy; the proxy adds auth + applies DevEco URL quirks + forwards.
+//
+// The `auth` hook (loader + methods) is still returned for forward-compat: on
+// opencode versions that DO load external plugin auth, the auth.loader's custom
+// fetch takes over (bypassing the proxy). On versions that don't, the proxy is
+// the live path.
+import { ACCESS_TOKEN_EXPIRES_MS, DEVECO_DEFAULTS, DEVECO_EXIT_QUEUE_URL, OAUTH_DUMMY_KEY, PLUGIN_VERSION, PROVIDER_ID, exposedModelId, normalizeAffinityId, log, upstreamModelId, } from "./config.js";
+import { createLoginService } from "./auth-login.js";
+import { JsonTokenStore } from "./token-store.js";
+import { getDevecoProviderConfig, loadPersistedModels, resetModelCache } from "./models.js";
+import { DevEcoProxy, conversationKey } from "./proxy.js";
+import { applyVisionRouting } from "./vision-routing.js";
+import { normalizeOpenAIChatBody } from "./openai-normalize.js";
+import { envFetch } from "./env-fetch.js";
+// Default local proxy port. Kept in sync with README and the standalone CLI.
+const PROXY_PORT = Number(process.env.DEVECO_PROXY_PORT) || 17128;
+const PROXY_HOST = "127.0.0.1";
+const PROXY_BASE_URL = `http://${PROXY_HOST}:${PROXY_PORT}/v2`;
+// Shared singletons (used by the auth-hook fallback path).
+const tokenStore = new JsonTokenStore();
+const loginService = createLoginService(tokenStore);
+// Per-session Chat-Id map for the auth-loader fallback path.
+const sessionChatIdMap = new Map();
+/** Release the upstream queue slot, matching proxy.ts semantics (one retry). */
+function exitQueue(key, chatId, model, token, taskId) {
+    const url = `${DEVECO_EXIT_QUEUE_URL}?modelId=${encodeURIComponent(model)}`;
+    const attempt = (retriesLeft) => {
+        envFetch(url, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Session-Id": key,
+                "Chat-Id": chatId,
+                "x-deveco-session": key,
+                "x-deveco-task": taskId,
+                Authorization: `Bearer ${token}`,
+            },
+            signal: AbortSignal.timeout(5_000),
+        })
+            .then((r) => {
+            if (r.ok)
+                log.debug(`exitSessionQueue -> ${r.status}`);
+            else if (retriesLeft > 0) {
+                log.warn(`exitSessionQueue -> HTTP ${r.status}, retrying`);
+                setTimeout(() => attempt(retriesLeft - 1), 500);
+            }
+            else
+                log.warn(`exitSessionQueue -> HTTP ${r.status}`);
+        })
+            .catch((err) => {
+            if (retriesLeft > 0) {
+                log.warn("exitSessionQueue failed, retrying", { error: String(err) });
+                setTimeout(() => attempt(retriesLeft - 1), 500);
+            }
+            else
+                log.warn("exitSessionQueue failed", { error: String(err) });
+        });
+    };
+    attempt(1);
+}
+/** True when the auth loader is still talking to our own local proxy. */
+function isProxyUrl(input) {
+    try {
+        const u = input instanceof URL
+            ? input
+            : new URL(typeof input === "string" ? input : input.url);
+        return u.hostname === PROXY_HOST || u.hostname === "localhost";
+    }
+    catch {
+        return false;
+    }
+}
+// Proxy lifecycle — started once on plugin load.
+let proxyStarted = null;
+function startProxy() {
+    if (!proxyStarted) {
+        proxyStarted = (async () => {
+            const proxy = new DevEcoProxy({ port: PROXY_PORT, hostname: PROXY_HOST });
+            await proxy.start();
+            return proxy;
+        })().catch((err) => {
+            proxyStarted = null; // allow retry
+            log.error("failed to start DevEco proxy", { error: String(err) });
+            throw err;
+        });
+    }
+    return proxyStarted;
+}
+// ---------------------------------------------------------------------------
+// config hook — inject a `deveco` provider that points at our local proxy.
+// The model list comes from the catalog snapshot the last successful fetch
+// persisted, so cloud-side model changes reach the picker on the next start;
+// the static defaults cover a cold start. A user-owned entry keeps its own
+// fields and per-model settings.
+// ---------------------------------------------------------------------------
+/**
+ * Merge the cloud catalog with whatever the user configured: the cloud supplies
+ * the metadata (context limits, effort tiers, modalities), an explicit user
+ * entry still wins field by field.
+ */
+export function mergeModels(catalog, userModels) {
+    const merged = { ...catalog };
+    if (!userModels || typeof userModels !== "object")
+        return merged;
+    for (const [id, userModel] of Object.entries(userModels)) {
+        const fromCatalog = merged[id];
+        merged[id] =
+            fromCatalog && userModel && typeof userModel === "object"
+                ? { ...fromCatalog, ...userModel }
+                : userModel;
+    }
+    return merged;
+}
+/** Rename catalog keys to the public ids clients select from. */
+function exposeModelCatalog(models) {
+    const exposed = {};
+    for (const [id, info] of Object.entries(models))
+        exposed[exposedModelId(id)] = info;
+    return exposed;
+}
+export function applyConfigHook(cfg) {
+    try {
+        if (!cfg || typeof cfg !== "object")
+            return;
+        cfg.provider ??= {};
+        const persisted = loadPersistedModels();
+        const persistedModels = persisted?.config.models;
+        const catalog = exposeModelCatalog(persistedModels && Object.keys(persistedModels).length > 0
+            ? persistedModels
+            : DEVECO_DEFAULTS.provider.models);
+        const existing = cfg.provider[PROVIDER_ID];
+        if (!existing) {
+            const provider = {
+                name: "DevEco Code",
+                npm: "@ai-sdk/openai-compatible",
+                api: PROXY_BASE_URL,
+                env: [],
+                options: { apiKey: OAUTH_DUMMY_KEY, baseURL: PROXY_BASE_URL },
+                models: { ...catalog },
+            };
+            cfg.provider[PROVIDER_ID] = provider;
+        }
+        else if (typeof existing === "object") {
+            // A user-owned entry keeps its own fields (baseURL, options, …); only the
+            // model list is merged into it. Rename legacy bare ids before merging so
+            // an existing `GLM-5.3` override lands on the exposed `GLM-5.3-DevEco`.
+            const entry = existing;
+            const userModels = entry.models && typeof entry.models === "object"
+                ? exposeModelCatalog(entry.models)
+                : entry.models;
+            entry.models = mergeModels({ ...catalog }, userModels);
+        }
+        // opencode resolves the small model from this top-level field (the DevEco
+        // fork reads task_default_model_map directly), so pointing it at the
+        // cloud's declared model keeps title generation and similar side-tasks on
+        // the model DevEco intends. A user-set small_model wins.
+        const small = persisted?.taskMap?.small_model;
+        if (small && typeof small === "string" && !cfg.small_model) {
+            cfg.small_model = `${PROVIDER_ID}/${exposedModelId(small)}`;
+        }
+    }
+    catch (err) {
+        log.error("config hook failed", { error: String(err) });
+    }
+}
+// ---------------------------------------------------------------------------
+// auth.loader (forward-compat fallback) — injects the Bearer token directly
+// when opencode loads plugin auth. Used by opencode versions that support
+// external plugin auth; otherwise unused (the proxy is the live path).
+// ---------------------------------------------------------------------------
+function isOAuthLike(v) {
+    return !!v && typeof v === "object" && v.type === "oauth";
+}
+function buildAuthedFetch(getAuth, persistAuth) {
+    return async function devEcoFetch(requestInput, init) {
+        if (init?.headers) {
+            if (init.headers instanceof Headers) {
+                init.headers.delete("authorization");
+                init.headers.delete("Authorization");
+            }
+            else if (Array.isArray(init.headers)) {
+                init.headers = init.headers.filter(([k]) => k.toLowerCase() !== "authorization");
+            }
+            else {
+                const h = { ...init.headers };
+                delete h["authorization"];
+                delete h["Authorization"];
+                init.headers = h;
+            }
+        }
+        const current = await getAuth();
+        if (!isOAuthLike(current))
+            return envFetch(requestInput, init);
+        if (!current.access || (current.expires ?? 0) < Date.now()) {
+            const jwtToken = await tokenStore.load();
+            if (jwtToken) {
+                const refreshed = await loginService.refreshToken(jwtToken);
+                if (refreshed?.accessToken) {
+                    const exp = Date.now() + ACCESS_TOKEN_EXPIRES_MS;
+                    await persistAuth(refreshed.accessToken, refreshed.refreshToken, exp);
+                    current.access = refreshed.accessToken;
+                    if (current.refresh !== undefined)
+                        current.refresh = refreshed.refreshToken;
+                    current.expires = exp;
+                }
+                else {
+                    return new Response(JSON.stringify({ error: "Token refresh failed. Please re-login." }), { status: 401, headers: { "Content-Type": "application/json" } });
+                }
+            }
+            else {
+                return new Response(JSON.stringify({ error: "DevEco login expired. Please re-login." }), { status: 401, headers: { "Content-Type": "application/json" } });
+            }
+        }
+        const headers = new Headers();
+        if (init?.headers) {
+            if (init.headers instanceof Headers) {
+                init.headers.forEach((v, k) => headers.set(k, v));
+            }
+            else if (Array.isArray(init.headers)) {
+                for (const [k, v] of init.headers)
+                    if (v !== undefined)
+                        headers.set(k, String(v));
+            }
+            else {
+                for (const [k, v] of Object.entries(init.headers))
+                    if (v !== undefined)
+                        headers.set(k, String(v));
+            }
+        }
+        if (current.access)
+            headers.set("authorization", `Bearer ${current.access}`);
+        headers.set("lang", "en");
+        let finalInput = requestInput;
+        let convKey = crypto.randomUUID().replace(/-/g, "");
+        let upstreamModel = "";
+        let streamBody = false;
+        let bodyForFetch;
+        if (typeof init?.body === "string") {
+            try {
+                const parsed = JSON.parse(init.body);
+                let modelRewritten = false;
+                if (typeof parsed.model === "string") {
+                    upstreamModel = parsed.model;
+                    const upstream = upstreamModelId(upstreamModel);
+                    if (upstream !== upstreamModel) {
+                        parsed.model = upstream;
+                        upstreamModel = upstream;
+                        modelRewritten = true;
+                    }
+                }
+                if (parsed.stream === true)
+                    streamBody = true;
+                const explicit = headers.get("x-deveco-session") ||
+                    headers.get("x-session-affinity") ||
+                    headers.get("x-session-id");
+                convKey = (explicit && normalizeAffinityId(explicit)) || conversationKey(parsed);
+                // Same DevEco quirks as the proxy: role/token-cap/tool_choice rewrites
+                // and the transparent vision fallback.
+                const normalized = normalizeOpenAIChatBody(parsed);
+                const routing = applyVisionRouting(normalized.body);
+                if (routing) {
+                    upstreamModel = routing.upstreamModel;
+                    if (routing.rerouted || routing.imagesStripped || normalized.changed || modelRewritten) {
+                        bodyForFetch = JSON.stringify(routing.body);
+                    }
+                }
+                if (!streamBody) {
+                    const url = requestInput instanceof URL
+                        ? new URL(requestInput.toString())
+                        : new URL(typeof requestInput === "string"
+                            ? requestInput
+                            : requestInput.url);
+                    url.pathname = url.pathname
+                        .replace(/\/$/, "")
+                        .replace(/\/chat\/completions$/, "/no-stream/chat/completions");
+                    finalInput = url;
+                }
+            }
+            catch {
+                /* ignore */
+            }
+        }
+        let chatId = sessionChatIdMap.get(convKey);
+        if (!chatId) {
+            // Bound the map like the proxy's chatIdFor: a long-lived process would
+            // otherwise accumulate one entry per conversation forever.
+            if (sessionChatIdMap.size >= 500) {
+                sessionChatIdMap.delete(sessionChatIdMap.keys().next().value);
+            }
+            chatId = crypto.randomUUID().replace(/-/g, "");
+            sessionChatIdMap.set(convKey, chatId);
+        }
+        const incomingTask = headers.get("x-deveco-task");
+        const taskId = (incomingTask && normalizeAffinityId(incomingTask)) ||
+            crypto.randomUUID().replace(/-/g, "");
+        headers.set("Chat-Id", chatId);
+        headers.set("Session-Id", convKey);
+        headers.set("x-deveco-session", convKey);
+        headers.set("x-deveco-task", taskId);
+        headers.set("x-deveco-client", `deveco-code@${PLUGIN_VERSION}`);
+        const initForFetch = { ...init, headers };
+        if (bodyForFetch !== undefined)
+            initForFetch.body = bodyForFetch;
+        void getDevecoProviderConfig(current.access ?? "").catch(() => { });
+        const directToUpstream = !isProxyUrl(requestInput);
+        const token = current.access ?? "";
+        const release = () => exitQueue(convKey, chatId, upstreamModel, token, taskId);
+        let response;
+        try {
+            response = await envFetch(finalInput, initForFetch);
+        }
+        catch (err) {
+            if (directToUpstream && upstreamModel)
+                release();
+            throw err;
+        }
+        if (!directToUpstream || !upstreamModel)
+            return response;
+        // For streams, release the queue slot only when the body has been fully
+        // consumed (or the client disconnects), matching the proxy's lifecycle.
+        if (streamBody && response.body) {
+            const wrapped = response.body.pipeThrough(new TransformStream({
+                flush() {
+                    release();
+                },
+            }));
+            return new Response(wrapped, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers,
+            });
+        }
+        release();
+        return response;
+    };
+}
+// ---------------------------------------------------------------------------
+// Plugin export
+// ---------------------------------------------------------------------------
+export const DevEcoPlugin = async (input) => {
+    log.info("opencode-deveco plugin LOADED; starting local proxy");
+    // Start the proxy (fire-and-forget; failures are logged).
+    void startProxy().catch(() => {
+        /* logged in startProxy */
+    });
+    const persistAuth = async (a, r, e) => {
+        try {
+            await input.client.auth.set({
+                path: { id: PROVIDER_ID },
+                body: { type: "oauth", access: a, refresh: r, expires: e },
+            });
+        }
+        catch (err) {
+            log.error("failed to persist refreshed auth via client.auth.set", {
+                error: String(err),
+            });
+        }
+    };
+    return {
+        config: async (cfg) => applyConfigHook(cfg),
+        auth: {
+            provider: PROVIDER_ID,
+            async loader(getAuth, _provider) {
+                const info = await getAuth();
+                if (!info)
+                    return {};
+                return {
+                    apiKey: OAUTH_DUMMY_KEY,
+                    fetch: buildAuthedFetch(getAuth, persistAuth),
+                };
+            },
+            methods: [
+                {
+                    type: "oauth",
+                    label: "Login with Huawei DevEco Account",
+                    async authorize() {
+                        return {
+                            url: "",
+                            instructions: "Opening browser for login...",
+                            method: "auto",
+                            async callback() {
+                                resetModelCache();
+                                const result = await loginService.login();
+                                if (!result.success) {
+                                    return {
+                                        type: "failed",
+                                        error: result.unsupportedRegion
+                                            ? "Sorry, only China site accounts are currently supported"
+                                            : result.error || "Login failed",
+                                    };
+                                }
+                                return {
+                                    type: "success",
+                                    provider: PROVIDER_ID,
+                                    access: result.userInfo?.accessToken || "",
+                                    refresh: result.userInfo?.refreshToken || "",
+                                    expires: Date.now() + ACCESS_TOKEN_EXPIRES_MS,
+                                };
+                            },
+                        };
+                    },
+                },
+            ],
+        },
+    };
+};
