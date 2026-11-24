@@ -554,9 +554,30 @@ export function apply(ctx, config) {
   // outer `ctx`. Registering on the outer ctx leaves `ctx.webServer` /
   // `ctx.tools` undefined, throws inside the callback, and the error is
   // swallowed — the fiber still reports "active" but nothing registers.
-  ctx.inject(['webServer'], (webCtx) => {
+  ctx.inject(['connection', 'webServer'], (webCtx) => {
     webCtx.effect(() => {
       const disposers = [];
+
+      // DSH browser/API credential check. Reject any request that is not from
+      // the authenticated DSH app (e.g. an unrelated web page in the user's
+      // browser calling http://127.0.0.1:.../plugins/dsh-connect-deveco/stop).
+      // Same-origin fetches from the DSH frontend carry its cookie, so the
+      // status chip and settings card keep working; everyone else gets
+      // 401/403. Fail closed if the check itself throws.
+      const rejected = (req, res) => {
+        let rejection;
+        try {
+          rejection = webCtx.connection.requestRejection(req);
+        } catch {
+          res.statusCode = 403;
+          res.end();
+          return true;
+        }
+        if (rejection === undefined) return false;
+        res.statusCode = rejection;
+        res.end();
+        return true;
+      };
 
       const route = (suffix, method, handler) =>
         webCtx.webServer.register({
@@ -564,6 +585,7 @@ export function apply(ctx, config) {
           path: `${ROUTE_BASE}${suffix}`,
           method,
           handler: async (req, res) => {
+            if (rejected(req, res)) return;
             if (!loopbackGate(req)) return sendJson(res, 403, { error: 'loopback only' });
             try {
               sendJson(res, 200, await handler());

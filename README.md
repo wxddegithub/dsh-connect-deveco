@@ -170,7 +170,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup-windows.ps1
 | `login` | 打开浏览器完成授权（已登录时不会弹窗） |
 | `logout` | 登出并清除本地凭据（代理保持运行） |
 
-也可直接用宿主代理的 HTTP 接口（仅回环可访问，端口 `17128`）：
+也可直接用宿主代理的 HTTP 接口（**仅回环 + DSH 登录态可访问**：每个请求都要经过 DSH 的 `requestRejection` 访问检查，浏览器里其它网页无法调用；端口 `17128`）：
 
 - `GET  /plugins/dsh-connect-deveco/status`
 - `POST /plugins/dsh-connect-deveco/start`
